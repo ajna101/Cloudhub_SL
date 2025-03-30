@@ -1,1490 +1,837 @@
 import streamlit as st
-import sqlite3
-import bcrypt
+import os
 import pandas as pd
-import boto3
-import numpy as np
 import time
-from openai import OpenAI
 import json
-from datetime import datetime
-from typing import List, Tuple
-from io import BytesIO
 import io
-from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import hashlib
 import matplotlib.pyplot as plt
+from datetime import datetime
+from io import StringIO
 
-st.set_page_config(page_title="EITA", layout="wide")
+# PDF & DOCX parsing and report generation
+import PyPDF2
+from docx import Document as DocxDocument
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
-EMBEDDING_MODEL = "text-embedding-ada-002"
-DB_NAME = "vector_chunks.db"
-COMPUTED_DB = "data.db"
-VALID_BUCKET = "etrm-etai-poc"
-REJECTED_BUCKET = "etai-rejected-files"
+# LangChain and vector store
+import faiss
+from langchain.vectorstores import FAISS as LC_FAISS
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.llms import OpenAI
+from langchain.chains import RetrievalQA
+from langchain.docstore.document import Document
 
-aws_access_key = st.secrets["AWS_ACCESS_KEY"]
-aws_secret_key = st.secrets["AWS_SECRET_KEY"]
+# SentenceTransformer for feedback and column matching
+from sentence_transformers import SentenceTransformer
 
 client = OpenAI(api_key= st.secrets["OPENAI_API_KEY"])
 
-computed_stats_json = []
+# --- Page configuration and Custom CSS ---
+st.set_page_config(
+    page_title="Test Defects RCA-CAPA Automation - AI Assistant",
+    page_icon="📂",
+    layout="wide"
+)
+st.markdown("""
+<style>
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    h1, h2, h3 {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    .stButton button {
+        background-color: #4CAF50;
+        color: white;
+        font-weight: bold;
+        border-radius: 10px;
+        padding: 0.5rem 1rem;
+        border: none;
+        transition: all 0.3s;
+    }
+    .stButton button:hover {
+        background-color: #45a049;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    .deviation-card {
+        background-color: #f9f9f9;
+        border-radius: 10px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        transition: all 0.3s;
+    }
+    .deviation-card:hover {
+        box-shadow: 0 10px 20px rgba(0,0,0,0.15);
+        transform: translateY(-2px);
+    }
+    .stSidebar .sidebar-content {
+        background-color: #f8f9fa;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # --- Initialize Session State ---
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "username" not in st.session_state:
     st.session_state.username = ""
-if "main_section" not in st.session_state:
-    st.session_state.main_section = "Data Management AI Agent"
-if "sub_section" not in st.session_state:
-    st.session_state.sub_section = "Pipeline Dashboard"
+if "metadata_dict" not in st.session_state:
+    st.session_state.metadata_dict = {}
+if "processed_data" not in st.session_state:
+    st.session_state.processed_data = None
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "deviation_logs" not in st.session_state:
+    st.session_state.deviation_logs = []
+if "root_causes" not in st.session_state:
+    st.session_state.root_causes = {}
+if "feedback_logs" not in st.session_state:
+    st.session_state.feedback_logs = []
+if "prompt_instruction" not in st.session_state:
+    st.session_state.prompt_instruction = "Provide a clear and concise response."
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
+if "confidence_score" not in st.session_state:
+    st.session_state.confidence_score = None
+if "retrieved_docs" not in st.session_state:
+    st.session_state.retrieved_docs = None
+if "query_input" not in st.session_state:
+    st.session_state.query_input = ""
+if "feedback_submitted" not in st.session_state:
+    st.session_state.feedback_submitted = False
+if "feedback_button_clicked" not in st.session_state:
+    st.session_state.feedback_button_clicked = False
+if "source_document_name" not in st.session_state:
+    st.session_state.source_document_name = "Unknown"
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+if "qa_chain" not in st.session_state:
+    st.session_state.qa_chain = None
 
-# --- Database Functions ---
-def init_sqlite_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password BLOB NOT NULL,
-            role TEXT DEFAULT 'user'
-        )
-    """)
+# --- LLM Model for Column Matching and Feedback ---
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS document_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chunk_text TEXT,
-            embedding BLOB,
-            source_file TEXT
-        )
-    """)
-    cursor.execute('''
-      CREATE TABLE IF NOT EXISTS agent_detail (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL,
-          model TEXT NOT NULL,
-          temperature REAL DEFAULT 0.7,
-          prompt TEEXTT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS feedback_log (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_query TEXT,
-                        query_responce TEXT,
-                        user_reaction BOOLEAN DEFAULT 0,
-                        user_feedback TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                      )''')
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS file_tracking (
-            upload_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_name TEXT,
-            date_processed TEXT,
-            json_contents TEXT,
-            is_processed INTEGER
-        );
-    """)
-    conn.commit()
-    conn.close()
+# --- Authentication ---
+USER_CREDENTIALS = {
+    "admin": "81dc9bdb52d04dc20036dbd8313ed055",  # MD5 for "1234"
+    "user": "81dc9bdb52d04dc20036dbd8313ed055"      # MD5 for "password"
+}
 
-def init_computed_db():
-    conn = sqlite3.connect(COMPUTED_DB)
-    conn.close()
+def hash_password(password):
+    return hashlib.md5(password.encode()).hexdigest()
 
-init_sqlite_db()
+def authenticate(username, password):
+    return USER_CREDENTIALS.get(username) == hash_password(password)
 
-def register_user(username, password):
-    """Registers a new user with hashed password."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-
-    try:
-        c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_password))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-def authenticate_user(username, password):
-    """Authenticates user with hashed password verification."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT password FROM users WHERE username = ?", (username,))
-    result = c.fetchone()
-    conn.close()
-
-    if result:
-        stored_password = result[0]  # Already in bytes format
-        return bcrypt.checkpw(password.encode('utf-8'), stored_password)
-
-    return False
-
-# --- Sidebar Navigation ---
-def sidebar_menu():
-    """Sidebar with main and sub-sections."""
-    with st.sidebar:
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.write(' ')
-
-        with col2:
-          st.image("https://img1.wsimg.com/isteam/ip/495c53b7-d765-476a-99bd-58ecde467494/blob-411e887.png/:/rs=w:127,h:95,cg:true,m/cr=w:127,h:95/qt=q:95")
-
-        with col3:
-            st.write(' ')
-
-        st.markdown("<h2 style='text-align: center;'>ETAI Energey Trading AI Platform</h2>", unsafe_allow_html=True)
-        st.divider()
-
-        # Main Sections
-        main_section = st.radio(
-            "Select AI Agent",
-            ["Data Management AI Agent", "RAG AI Agent", "Application AI Agent"],
-            index=["Data Management AI Agent", "RAG AI Agent", "Application AI Agent"].index(st.session_state.main_section)
-        )
-
-        st.session_state.main_section = main_section
-
-        # Sub-sections dictionary
-        sub_sections = {
-            "Data Management AI Agent": ["Pipeline Dashboard", "Data Pipeline", "Processed Data"],
-            "RAG AI Agent": ["Dashboard", "Configure & Upload", "Fine Tuning", "Settings"],
-            "Application AI Agent": ["Energy Tradeing Analysis", "Graph Query" ,"Deviation Analysis", "Root Cause Analysis", "Analysis History", "User Feedback"]
-        }
-
-        # Ensure sub_section is valid for the current main_section
-        if st.session_state.sub_section not in sub_sections[main_section]:
-            st.session_state.sub_section = sub_sections[main_section][0]
-
-        sub_section = st.radio(
-            f"Select {main_section} Section",
-            sub_sections[main_section],
-            index=sub_sections[main_section].index(st.session_state.sub_section)
-        )
-
-        st.session_state.sub_section = sub_section
-
-        st.divider()
-
+def login_page():
+    st.title("🔐 Login to Deviation Assistant")
+    username = st.text_input("👤 Username", key="login_username_input")
+    password = st.text_input("🔑 Password", type="password", key="login_password_input")
+    if st.button("Login", key="login_button"):
+        if authenticate(username, password):
+            st.session_state.logged_in = True
+            st.session_state.username = username
+            st.success("✅ Login successful! Redirecting...")
+            st.rerun()
+        else:
+            st.error("❌ Invalid username or password")
+    st.stop()  # Prevents the rest of the app from running if not logged in
 
 def logout():
-    """Logs out the user."""
     st.session_state.logged_in = False
     st.session_state.username = ""
     st.rerun()
 
-def top_right_menu():
-    """Displays the user profile and logout button."""
-    username = st.session_state.get('username', 'Guest')
+# --- Helper Functions for File Parsing and Metadata ---
+def extract_text_from_file(uploaded_file, file_type):
+    text_data = []
+    if file_type == "txt":
+        stringio = StringIO(uploaded_file.getvalue().decode("utf-8"))
+        text_data = stringio.readlines()
+    elif file_type == "pdf":
+        pdf_reader = PyPDF2.PdfReader(uploaded_file)
+        text_data = [page.extract_text() for page in pdf_reader.pages if page.extract_text()]
+    elif file_type == "csv":
+        df = pd.read_csv(uploaded_file)
+        text_data = df.astype(str).apply(lambda x: ' '.join(x), axis=1).tolist()
+    elif file_type == "docx":
+        doc = DocxDocument(uploaded_file)
+        text_data = [para.text.strip() for para in doc.paragraphs if para.text.strip()]
+    return text_data
 
-    col1, col2 = st.columns([8, 2])
-    with col1:
-        st.markdown(f"👤 **{username}**", unsafe_allow_html=True)
-    with col2:
-        if st.button("🔴 Logout", key="logout_btn", help="Logout from the platform"):
+def load_metadata_file(metadata_file):
+    if metadata_file:
+        try:
+            metadata_df = pd.read_csv(metadata_file)
+            if "Category" in metadata_df.columns and "Keywords" in metadata_df.columns:
+                metadata_dict = {
+                    row["Category"]: row["Keywords"].lower().split(",")
+                    for _, row in metadata_df.iterrows()
+                }
+                st.session_state.metadata_dict = metadata_dict
+                st.success("✅ Metadata file uploaded successfully!")
+            else:
+                st.error("❌ Incorrect metadata format! Ensure columns: 'Category' and 'Keywords'.")
+        except Exception as e:
+            st.error(f"❌ Error reading metadata file: {e}")
+
+def load_data_file(data_file):
+    try:
+        df = pd.read_csv(data_file)
+        st.session_state.processed_data = df
+        st.success("✅ Successfully loaded data file!")
+        return df
+    except Exception as e:
+        st.error(f"❌ Error loading data file: {e}")
+        return None
+
+def load_pipeline_metadata_file(metadata_file):
+    metadata_dict = {}
+    try:
+        if metadata_file.name.endswith(".csv"):
+            df = pd.read_csv(metadata_file)
+            field_name_col = "Field_Name"
+            description_col = "Definition"
+            if field_name_col not in df.columns or description_col not in df.columns:
+                st.error(f"❌ Metadata file is missing required columns. Found: {list(df.columns)}")
+                return {}
+            metadata_dict = dict(zip(df[field_name_col], df[description_col]))
+        elif metadata_file.name.endswith(".json"):
+            metadata_dict = json.load(metadata_file)
+        st.session_state.metadata_dict = metadata_dict
+        st.success(f"✅ Metadata file loaded successfully with {len(metadata_dict)} fields!")
+    except Exception as e:
+        st.error(f"❌ Error loading metadata file: {e}")
+    return metadata_dict
+
+def map_columns_with_llm(data_columns, metadata_dict):
+    column_mapping = {}
+    used_names = set()
+    for col in data_columns:
+        if col in metadata_dict:
+            mapped_name = metadata_dict[col]
+        else:
+            col_embedding = model.encode(col)
+            best_match = None
+            best_score = -1
+            for meta_field, description in metadata_dict.items():
+                meta_embedding = model.encode(meta_field)
+                score = col_embedding.dot(meta_embedding) / (np.linalg.norm(col_embedding) * np.linalg.norm(meta_embedding))
+                if score > best_score:
+                    best_score = score
+                    best_match = meta_field
+            mapped_name = metadata_dict.get(best_match, "Unknown Field")
+        original_mapped_name = mapped_name
+        counter = 1
+        while mapped_name in used_names:
+            mapped_name = f"{original_mapped_name} ({counter})"
+            counter += 1
+        used_names.add(mapped_name)
+        column_mapping[col] = mapped_name
+    return column_mapping
+
+def store_metadata_in_vector_db(metadata_dict):
+    if "OPENAI_API_KEY" not in os.environ or not os.environ["OPENAI_API_KEY"]:
+        st.error("❌ OpenAI API key is missing! Set `OPENAI_API_KEY` before proceeding.")
+        return
+    documents = [Document(page_content=f"{key}: {value}") for key, value in metadata_dict.items()]
+    embedding_model = OpenAIEmbeddings(openai_api_key=os.environ["OPENAI_API_KEY"])
+    vector_store = LC_FAISS.from_documents(documents, embedding_model)
+    st.session_state.vector_store = vector_store
+    st.success(f"✅ Stored {len(metadata_dict)} metadata entries in FAISS vector database!")
+
+# --- Deviation Analysis Functions ---
+def categorize_root_cause(root_cause):
+    if not st.session_state.metadata_dict:
+        return "Other"
+    root_cause = root_cause.lower()
+    for category, keywords in st.session_state.metadata_dict.items():
+        if any(keyword.strip() in root_cause for keyword in keywords):
+            return category
+    return "Other"
+
+def plot_fishbone(causes):
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.set_title("Fishbone Diagram - Root Causes", fontsize=16, fontweight="bold")
+    ax.plot([1, 11], [5, 5], "k-", lw=3)
+    #categories = ["Functional Defect", "UI-UX", "Integration Defect", "Validation/Rules Error", "Test Data Issue", "Environment Config", "Tool/Script Issue", "People (Human Error)", "Process Gap"]
+    categories = [
+    "Functional Defect", "UI-UX", "Integration Defect",
+    "Validation/Rules Error", "Test Data Issue", "Environment Config",
+    "Tool/Script Issue", "People (Human Error)", "Process Gap","Other"
+    ]
+
+    category_causes = {cat: [] for cat in categories}
+    for cause in causes:
+        category = categorize_root_cause(cause)
+        category_causes[category].append(cause)
+    #y_positions = [8, 7, 6, 4, 3, 2]
+    y_positions = np.linspace(2, 8, len(category_causes))
+
+    x_main = 6
+    for i, (category, cause_list) in enumerate(category_causes.items()):
+        y = y_positions[i]
+        ax.plot([x_main - 2, x_main], [y, 5], "k-", lw=2)
+        ax.text(x_main - 2.5, y, category, fontsize=13, fontweight="bold", verticalalignment="center")
+        for j, cause in enumerate(cause_list):
+            ax.text(x_main + 1, y - j * 0.4, f"- {cause}", fontsize=11, verticalalignment="center")
+    ax.axis("off")
+    st.pyplot(fig)
+
+def generate_fda_capa_section(defect_text, root_causes, llm_chain):
+    prompt = f"""
+You are an FDA compliance expert. Based on the following defect description and identified root causes, generate a detailed CAPA report compliant with FDA CSA and 21 CFR Part 11.
+
+Include the following:
+1. Problem Summary
+2. Root Cause
+3. Corrective Actions
+4. Preventive Actions
+5. Risk Assessment
+6. Verification of Effectiveness (VOE)
+7. SOP or Compliance Reference
+8. Assigned Owner and Timeline
+
+Defect:
+{defect_text}
+
+Root Causes:
+{json.dumps(root_causes, indent=2)}
+"""
+    return llm_chain.run(prompt).strip()
+
+
+def generate_pdf_report(transaction_detail, analysis, root_causes, capa_suggestions, fda_capa_text):
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    pdf.setTitle("Defect Report")
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(200, 750, "🚀 Test Defect Report")
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(200, 730, f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    pdf.line(50, 720, 550, 720)
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(50, 700, "🔍 Defect Details")
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(50, 680, f"Defect Detail: {transaction_detail}")
+    pdf.drawString(50, 660, f"Analysis: {analysis}")
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(50, 640, "⚠️ Root Causes Identified")
+    pdf.setFont("Helvetica", 12)
+    y = 620
+    for cause in root_causes:
+        pdf.drawString(60, y, f"- {cause}")
+        y -= 20
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(50, y - 20, "✅ Corrective & Preventive Actions (CAPA)")
+    pdf.setFont("Helvetica", 12)
+    y -= 40
+    for action in capa_suggestions:
+        pdf.drawString(60, y, f"- {action}")
+        y -= 20
+
+        # New Page for FDA CAPA
+    pdf.showPage()
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(50, 750, "📋 FDA CSA-Based CAPA Report")
+    pdf.setFont("Helvetica", 11)
+
+    y = 730
+    for line in fda_capa_text.split("\n"):
+        if y < 80:
+            pdf.showPage()
+            y = 750
+        pdf.drawString(50, y, line[:100])
+        y -= 15
+
+
+    pdf.save()
+    buffer.seek(0)
+    return buffer
+
+# --- Feedback-Based Fine-Tuning Functions ---
+def load_feedback_data():
+    try:
+        with open("feedback_data.json", "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def create_faiss_index(feedback_data):
+    if not feedback_data:
+        return None, None
+    queries = [fb["Defect Detail"] for fb in feedback_data]
+    query_embeddings = np.array([model.encode(q) for q in queries])
+    index = faiss.IndexFlatL2(query_embeddings.shape[1])
+    index.add(query_embeddings)
+    return index, feedback_data
+
+def extract_insights_from_feedback(feedback_items):
+    insights = []
+    for item in feedback_items:
+        if item["User Feedback"] == "👎 No" and item["Comments"].strip():
+            insights.append(item["Comments"])
+    return insights
+
+def retrieve_feedback_insights(query, index, feedback_data, max_results=3, threshold=0.8):
+    if index is None:
+        return []
+    query_vector = model.encode(query).reshape(1, -1)
+    distances, indices = index.search(query_vector, k=max_results)
+    relevant_feedback = []
+    for i, idx in enumerate(indices[0]):
+        if distances[0][i] < threshold:
+            relevant_feedback.append(feedback_data[idx])
+    return extract_insights_from_feedback(relevant_feedback)
+
+def blend_analysis_with_feedback(base_analysis, feedback_insights):
+    if not feedback_insights:
+        return base_analysis
+    combined_analysis = base_analysis + "\n\n**Additional Insights from Similar Cases:**\n"
+    for i, insight in enumerate(feedback_insights):
+        combined_analysis += f"{i+1}. {insight}\n"
+    return combined_analysis
+
+def calculate_confidence_score(base_score, feedback_insights, retrieved_docs=None):
+    if retrieved_docs:
+        num_docs = len(retrieved_docs)
+        rank_scores = np.linspace(1.0, 0.5, num_docs)
+        base_score = round(np.mean(rank_scores), 2)
+    if feedback_insights:
+        feedback_boost = min(0.2, 0.05 * len(feedback_insights))
+        return min(0.95, base_score + feedback_boost)
+    return base_score
+
+def prepare_training_data(feedback_logs):
+    training_pairs = []
+    for log in feedback_logs:
+        if log["User Feedback"] == "👎 No" and log["Comments"].strip():
+            training_pairs.append({
+                "query": log.get("Transaction Detail", log.get("Defect Detail", "")),
+                "improved_response": log["Comments"],
+                "original_response": log["Analysis"]
+            })
+    return training_pairs
+
+def save_training_data(training_pairs):
+    with open("training_data.json", "w") as f:
+        json.dump(training_pairs, f, indent=4)
+    return len(training_pairs)
+
+def retrieve_corrected_response(query, index, feedback_data, threshold=0.7):
+    if index is None:
+        return None
+    query_vector = model.encode(query).reshape(1, -1)
+    distances, indices = index.search(query_vector, k=1)
+    if distances[0][0] < threshold:
+        matched_feedback = feedback_data[indices[0][0]]
+        if matched_feedback["User Feedback"] == "👎 No":
+            return matched_feedback["Comments"]
+    return None
+
+# --- Sidebar Navigation and Main Page Content ---
+if not st.session_state.logged_in:
+    login_page()
+else:
+    # --- Sidebar Navigation ---
+    with st.sidebar:
+        st.title(f"🚀 Welcome, {st.session_state['username']}")
+        if st.button("Logout"):
             logout()
 
-# --- CSS Styling ---
-st.markdown("""
-    <style>
-        /* Sidebar */
-        [data-testid="stSidebar"] {
-            box-shadow: 2px 0 10px rgba(0,0,0,0.1);
-        }
-
-        /* Buttons */
-        button {
-            border-radius: 10px !important;
-        }
-        button:hover {
-            background: #007BFF !important;
-            color: white !important;
-            border: none !important;
-        }
-
-        /* Title & Text */
-        h1, h2, h3 {
-            color: #007BFF;
-        }
-
-        /* Custom Divider */
-        hr {
-            border: 1px solid #ccc;
-        }
-    .login-btn {
-        width: 100%;
-        background-color: #4CAF50;
-        color: white;
-        padding: 12px 20px;
-        margin: 10px 0;
-        border: none;
-        border-radius: 5px;
-        cursor: pointer;
-        font-size: 16px;
-        transition: 0.3s;
-    }
-    .login-btn:hover {
-        background-color: #45a049;
-    }
-    .login-input {
-        width: 100%;
-        padding: 10px;
-        margin: 10px 0;
-        display: inline-block;
-        border: 1px solid #ccc;
-        border-radius: 5px;
-        box-sizing: border-box;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-def process_metadata_alias(metadata_df: pd.DataFrame):
-    global alias_mapping
-    alias_mapping = {}
-    # Assumes metadata CSV has columns named 'Column' and 'Description'
-    for _, row in metadata_df.iterrows():
-        col_name = str(row.get("Column", "")).strip()
-        description = str(row.get("Description", "")).strip().lower()
-        if col_name and description:
-            alias_mapping[description] = col_name
-    return alias_mapping
-
-def upload_to_s3(file, filename, bucket):
-    try:
-        # Determine folder based on filename
-        folder = ""
-        if "NOP_CO2" in filename.upper():
-            folder = "CO2/"
-        elif "NOP_NG" in filename.upper():
-            folder = "NG/"
-        elif "NOP_PW" in filename.upper():
-            folder = "PW/"
-        else:
-            folder = "misc/"  # fallback or unknown
-
-        s3_key = folder + filename  # full path in S3
-
-        # Upload to S3
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key
-        )
-        s3.upload_fileobj(file, bucket, s3_key)
-
-        return True, f"✅ Uploaded {filename} to S3 bucket '{bucket}' in folder '{folder}'"
-    except Exception as e:
-        return False, f"❌ Upload failed: {e}"
-
-
-def upload_to_s3_old(file, filename, bucket):
-    try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=aws_access_key,
-            aws_secret_access_key=aws_secret_key
-        )
-        s3.upload_fileobj(file, bucket, filename)
-        return True, f"✅ Uploaded {filename} to S3 bucket '{bucket}'"
-    except Exception as e:
-        return False, f"❌ Upload failed: {e}"
-
-def validate_against_metadata(file_df: pd.DataFrame, metadata_df: pd.DataFrame, file_id: str) -> bool:
-    file_cols = set(file_df.columns.str.strip().str.upper())
-    metadata_cols = set(metadata_df["Field_Name"].str.strip().str.upper())
-
-    st.subheader(f"🔍 Column Comparison for `{file_id}`")
-    st.write("🗂 **Data File Columns**:")
-    st.code("\n".join(sorted(file_cols)))
-    st.write("📘 **Metadata Columns**:")
-    st.code("\n".join(sorted(metadata_cols)))
-
-    missing_in_file = metadata_cols - file_cols
-    extra_in_file = file_cols - metadata_cols
-
-    if missing_in_file:
-        st.error(f"❌ Columns missing in data file: {', '.join(missing_in_file)}")
-    if extra_in_file:
-        st.warning(f"⚠️ Extra columns in data file: {', '.join(extra_in_file)}")
-
-    if not missing_in_file:
-        st.success("✅ Validation Passed.")
-        return True
-    else:
-        st.error("❌ Validation Failed.")
-        return False
-
-
-
-def store_processed_data_in_sqlite(file_name, report_date, processed_data):
-    """Stores processed statistics in SQLite."""
-    conn = sqlite3.connect("data_store.db")
-    cursor = conn.cursor()
-
-    # Convert processed statistics to JSON
-    processed_json = json.dumps(processed_data)
-
-    # Insert processed data into SQLite
-    cursor.execute('''
-        INSERT INTO processed_data (file_name, report_date, processed_data, processed_flag)
-        VALUES (?, ?, ?, ?)
-    ''', (file_name, report_date, processed_json, 1))
-
-    conn.commit()
-    conn.close()
-    print(f"✅ Processed data for {file_name} stored in SQLite")
-
-def sanitize_for_json(obj):
-    if isinstance(obj, list):
-        return [sanitize_for_json(i) for i in obj]
-    elif isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    elif isinstance(obj, pd.Timestamp):
-        return obj.strftime('%Y-%m-%d')
-    return obj
-
-def process_and_store_file(file_name: str, df: pd.DataFrame, cursor, folder_prefix):
-    # Trim and convert column names to uppercase
-    df.columns = df.columns.str.strip().str.upper()
-
-    # Convert REPORT_DATE to datetime format
-    def parse_dates(report_date):
-        for fmt in ['%d%b%y', '%d-%m-%Y']:  # Try different formats
-            try:
-                return pd.to_datetime(report_date, format=fmt)
-            except (ValueError, TypeError):
-                continue
-        return None  # Return None instead of NaT for JSON serialization
-
-    df['REPORT_DATE'] = df['REPORT_DATE'].astype(str).str.strip()  # Ensure it's string
-    df['REPORT_DATE'] = df['REPORT_DATE'].apply(parse_dates)  # Apply parsing function
-
-    if folder_prefix == 'CO2':
-        numeric_cols = ['VOLUME', 'MKTVAL', 'TRDVAL', 'TRDPRC']
-    elif folder_prefix == 'NG':
-        numeric_cols = ['VOLUME', 'VOLUME_TOTAL', 'QTY_PHY', 'MKT_VAL', 'QTY_FIN', 'TRD_VAL']
-    elif folder_prefix == 'PW':
-        numeric_cols = ['VOLUME_BL', 'VOLUME_PK', 'VOLUME_OFPK', 'MKT_VAL_BL', 'MKT_VAL_PK', 'MKT_VAL_OFPK', 'TRD_VAL_BL', 'TRD_VAL_PK', 'TRD_VAL_OFPK']
-    else:
-        raise ValueError(f"❌ Unknown folder prefix: {folder_prefix}")
-
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(',', '', regex=True)
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    # Grouping logic for each case
-    if folder_prefix == 'CO2':
-        df_daily_stats = df.groupby('REPORT_DATE').agg(
-            TOTAL_VOLUME=('VOLUME', 'sum'), AVG_VOLUME=('VOLUME', 'mean'),
-            MIN_VOLUME=('VOLUME', 'min'), MAX_VOLUME=('VOLUME', 'max'), STD_VOLUME=('VOLUME', 'std'),
-            TOTAL_TRDVAL=('TRDVAL', 'sum'), AVG_TRDVAL=('TRDVAL', 'mean'),
-            MIN_TRDVAL=('TRDVAL', 'min'), MAX_TRDVAL=('TRDVAL', 'max'), STD_TRDVAL=('TRDVAL', 'std'),
-            TOTAL_MKTVAL=('MKTVAL', 'sum'), AVG_MKTVAL=('MKTVAL', 'mean'),
-            MIN_MKTVAL=('MKTVAL', 'min'), MAX_MKTVAL=('MKTVAL', 'max'), STD_MKTVAL=('MKTVAL', 'std'),
-            TOTAL_TRDPRC=('TRDPRC', 'sum'), AVG_TRDPRC=('TRDPRC', 'mean'),
-            MIN_TRDPRC=('TRDPRC', 'min'), MAX_TRDPRC=('TRDPRC', 'max'), STD_TRDPRC=('TRDPRC', 'std')
-        ).reset_index()
-
-    elif folder_prefix == 'NG':
-        df_daily_stats = df.groupby('REPORT_DATE').agg(
-            TOTAL_VOLUME=('VOLUME', 'sum'), AVG_VOLUME=('VOLUME', 'mean'),
-            MIN_VOLUME=('VOLUME', 'min'), MAX_VOLUME=('VOLUME', 'max'), STD_VOLUME=('VOLUME', 'std'),
-            TOTAL_VOLUME_TOTAL=('VOLUME_TOTAL', 'sum'), AVG_VOLUME_TOTAL=('VOLUME_TOTAL', 'mean'),
-            MIN_VOLUME_TOTAL=('VOLUME_TOTAL', 'min'), MAX_VOLUME_TOTAL=('VOLUME_TOTAL', 'max'), STD_VOLUME_TOTAL=('VOLUME_TOTAL', 'std'),
-            TOTAL_QTY_PHY=('QTY_PHY', 'sum'), AVG_QTY_PHY=('QTY_PHY', 'mean'),
-            MIN_QTY_PHY=('QTY_PHY', 'min'), MAX_QTY_PHY=('QTY_PHY', 'max'), STD_QTY_PHY=('QTY_PHY', 'std'),
-            TOTAL_MKT_VAL=('MKT_VAL', 'sum'), AVG_MKT_VAL=('MKT_VAL', 'mean'),
-            MIN_MKT_VAL=('MKT_VAL', 'min'), MAX_MKT_VAL=('MKT_VAL', 'max'), STD_MKT_VAL=('MKT_VAL', 'std'),
-            TOTAL_QTY_FIN=('QTY_FIN', 'sum'), AVG_QTY_FIN=('QTY_FIN', 'mean'),
-            MIN_QTY_FIN=('QTY_FIN', 'min'), MAX_QTY_FIN=('QTY_FIN', 'max'), STD_QTY_FIN=('QTY_FIN', 'std'),
-            TOTAL_TRD_VAL=('TRD_VAL', 'sum'), AVG_TRD_VAL=('TRD_VAL', 'mean'),
-            MIN_TRD_VAL=('TRD_VAL', 'min'), MAX_TRD_VAL=('TRD_VAL', 'max'), STD_TRD_VAL=('TRD_VAL', 'std')
-        ).reset_index()
-
-    elif folder_prefix == 'PW':
-        df_daily_stats = df.groupby('REPORT_DATE').agg(
-            TOTAL_VOLUME_BL=('VOLUME_BL', 'sum'), AVG_VOLUME_BL=('VOLUME_BL', 'mean'),
-            MIN_VOLUME_BL=('VOLUME_BL', 'min'), MAX_VOLUME_BL=('VOLUME_BL', 'max'), STD_VOLUME_BL=('VOLUME_BL', 'std'),
-            TOTAL_VOLUME_PK=('VOLUME_PK', 'sum'), AVG_VOLUME_PK=('VOLUME_PK', 'mean'),
-            MIN_VOLUME_PK=('VOLUME_PK', 'min'), MAX_VOLUME_PK=('VOLUME_PK', 'max'), STD_VOLUME_PK=('VOLUME_PK', 'std'),
-            TOTAL_VOLUME_OFPK=('VOLUME_OFPK', 'sum'), AVG_VOLUME_OFPK=('VOLUME_OFPK', 'mean'),
-            MIN_VOLUME_OFPK=('VOLUME_OFPK', 'min'), MAX_VOLUME_OFPK=('VOLUME_OFPK', 'max'), STD_VOLUME_OFPK=('VOLUME_OFPK', 'std'),
-            TOTAL_MKT_VAL_BL=('MKT_VAL_BL', 'sum'), AVG_MKT_VAL_BL=('MKT_VAL_BL', 'mean'),
-            MIN_MKT_VAL_BL=('MKT_VAL_BL', 'min'), MAX_MKT_VAL_BL=('MKT_VAL_BL', 'max'), STD_MKT_VAL_BL=('MKT_VAL_BL', 'std'),
-            TOTAL_MKT_VAL_PK=('MKT_VAL_PK', 'sum'), AVG_MKT_VAL_PK=('MKT_VAL_PK', 'mean'),
-            MIN_MKT_VAL_PK=('MKT_VAL_PK', 'min'), MAX_MKT_VAL_PK=('MKT_VAL_PK', 'max'), STD_MKT_VAL_PK=('MKT_VAL_PK', 'std'),
-            TOTAL_MKT_VAL_OFPK=('MKT_VAL_OFPK', 'sum'), AVG_MKT_VAL_OFPK=('MKT_VAL_OFPK', 'mean'),
-            MIN_MKT_VAL_OFPK=('MKT_VAL_OFPK', 'min'), MAX_MKT_VAL_OFPK=('MKT_VAL_OFPK', 'max'), STD_MKT_VAL_OFPK=('MKT_VAL_OFPK', 'std'),
-            TOTAL_TRD_VAL_BL=('TRD_VAL_BL', 'sum'), AVG_TRD_VAL_BL=('TRD_VAL_BL', 'mean'),
-            MIN_TRD_VAL_BL=('TRD_VAL_BL', 'min'), MAX_TRD_VAL_BL=('TRD_VAL_BL', 'max'), STD_TRD_VAL_BL=('TRD_VAL_BL', 'std'),
-            TOTAL_TRD_VAL_PK=('TRD_VAL_PK', 'sum'), AVG_TRD_VAL_PK=('TRD_VAL_PK', 'mean'),
-            MIN_TRD_VAL_PK=('TRD_VAL_PK', 'min'), MAX_TRD_VAL_PK=('TRD_VAL_PK', 'max'), STD_TRD_VAL_PK=('TRD_VAL_PK', 'std'),
-            TOTAL_TRD_VAL_OFPK=('TRD_VAL_OFPK', 'sum'), AVG_TRD_VAL_OFPK=('TRD_VAL_OFPK', 'mean'),
-            MIN_TRD_VAL_OFPK=('TRD_VAL_OFPK', 'min'), MAX_TRD_VAL_OFPK=('TRD_VAL_OFPK', 'max'), STD_TRD_VAL_OFPK=('TRD_VAL_OFPK', 'std')
-        ).reset_index()
-
-    # Aggregation for BOOK, TGROUP1, SEGMENT
-    if folder_prefix == 'PW':
-        df_book_stats = df.groupby('BOOK').agg(
-            TOTAL_VOLUME_BL=('VOLUME_BL', 'sum'),
-            TOTAL_VOLUME_PK=('VOLUME_PK', 'sum'),
-            TOTAL_VOLUME_OFPK=('VOLUME_OFPK', 'sum')
-        ).reset_index() if 'BOOK' in df.columns else pd.DataFrame()
-
-        df_tgroup1_stats = df.groupby('TGROUP1').agg(
-            TOTAL_VOLUME_BL=('VOLUME_BL', 'sum'),
-            TOTAL_VOLUME_PK=('VOLUME_PK', 'sum'),
-            TOTAL_VOLUME_OFPK=('VOLUME_OFPK', 'sum')
-        ).reset_index() if 'TGROUP1' in df.columns else pd.DataFrame()
-
-        df_segment_stats = df.groupby('SEGMENT').agg(
-            TOTAL_VOLUME_BL=('VOLUME_BL', 'sum'),
-            TOTAL_VOLUME_PK=('VOLUME_PK', 'sum'),
-            TOTAL_VOLUME_OFPK=('VOLUME_OFPK', 'sum')
-        ).reset_index() if 'SEGMENT' in df.columns else pd.DataFrame()
-
-        df_bucket_stats = df.groupby('BUCKET').agg(
-            TOTAL_VOLUME_BL=('VOLUME_BL', 'sum'),
-            TOTAL_VOLUME_PK=('VOLUME_PK', 'sum'),
-            TOTAL_VOLUME_OFPK=('VOLUME_OFPK', 'sum')
-        ).reset_index() if 'BUCKET' in df.columns else pd.DataFrame()
-
-    else:  # Default case for CO2 and NG
-        df_book_stats = df.groupby('BOOK').agg(TOTAL_VOLUME=('VOLUME', 'sum')).reset_index() if 'BOOK' in df.columns else pd.DataFrame()
-        df_tgroup1_stats = df.groupby('TGROUP1').agg(TOTAL_VOLUME=('VOLUME', 'sum')).reset_index() if 'TGROUP1' in df.columns else pd.DataFrame()
-        df_segment_stats = df.groupby('SEGMENT').agg(TOTAL_VOLUME=('VOLUME', 'sum')).reset_index() if 'SEGMENT' in df.columns else pd.DataFrame()
-        df_bucket_stats = df.groupby('BUCKET').agg(TOTAL_VOLUME=('VOLUME', 'sum')).reset_index() if 'BUCKET' in df.columns else pd.DataFrame()
-
-    combined_json = {
-        "daily_totals": df_daily_stats.to_dict(orient='records'),
-        "row_level_data": df.to_dict(orient='records'),
-        "book_stats": df_book_stats.to_dict(orient='records'),
-        "tgroup1_stats": df_tgroup1_stats.to_dict(orient='records'),
-        "segment_stats": df_segment_stats.to_dict(orient='records'),
-        "bucket_stats": df_bucket_stats.to_dict(orient='records'),
-    }
-
-    sanitized_json = sanitize_for_json(combined_json)
-    cursor.execute(
-        "INSERT INTO file_tracking (file_name, date_processed, json_contents, is_processed) VALUES (?, datetime('now'), ?, 1)",
-        (file_name, json.dumps(sanitized_json))
-    )
-
-    return df
-
-def process_files_from_s3_folder(bucket_name, folder_prefix):
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=aws_access_key,
-        aws_secret_access_key=aws_secret_key
-    )
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    try:
-        objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=folder_prefix).get("Contents", [])
-        print(f"🔍 Found {len(objects)} files in folder: {folder_prefix}")
-        for obj in objects:
-            file_key = obj["Key"]
-            if not file_key.lower().endswith(".csv"):
-                continue
-
-            file_name = file_key.split("/")[-1]
-            cursor.execute("SELECT 1 FROM file_tracking WHERE file_name = ? AND is_processed = 1", (file_name,))
-            if cursor.fetchone():
-                print(f"⏭️ Skipping already processed file: {file_name}")
-                continue
-
-            try:
-                obj_data = s3.get_object(Bucket=bucket_name, Key=file_key)
-                file_stream = io.BytesIO(obj_data["Body"].read())
-                df = pd.read_csv(file_stream)
-                df_processed = process_and_store_file(file_name, df, cursor,folder_prefix)
-                conn.commit()
-                print(f"✅ Processed and saved: {file_name}")
-            except Exception as e:
-                print(f"❌ Failed to process {file_name}: {e}")
-
-    except Exception as e:
-        print(f"❌ Error accessing S3: {e}")
-    finally:
-        conn.close()
-
-def query_sqlite_json_with_openai(user_question):
-
-    # Load all JSON contents from SQLite
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_name, json_contents FROM file_tracking WHERE is_processed = 1")
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        print("⚠️ No processed JSON data found in the database.")
-        return
-
-    all_context = ""
-    for file_name, json_text in rows:
-        try:
-            json_data = json.loads(json_text)
-            # Truncate or format for prompt (you can adjust max length)
-            summary = json.dumps(json_data, indent=2)[:3000]
-            all_context += f"\n---\n📄 File: {file_name}\n{summary}"
-        except Exception as e:
-            all_context += f"\n---\n📄 File: {file_name}\n⚠️ Error reading JSON: {e}"
-
-    # Final prompt with user question
-    prompt = f"""
-        Below is preprocessed trading statistics stored in SQLite from multiple files:
-
-        {all_context}
-
-        Now, answer the following question based on the above data:
-
-        {user_question}
-    """
-
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    print("\n💬 GPT Answer:")
-    print(response.choices[0].message.content.strip())
-    return response.choices[0].message.content.strip()
-
-def add_agent_detail(name, model, temperature, prompt):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-    INSERT INTO agent_detail (name, model, temperature, prompt)
-    VALUES (?, ?, ?, ?)
-    ''', (name, model, temperature, prompt))
-    st.success(f"✅ Settings Saved!!")
-    conn.commit()
-    conn.close()
-
-def save_computed_data_to_sqlite(json_data, table_name="computed_data"):
-    if not json_data:
-        st.warning("No computed data available to save.")
-        return
-    conn = sqlite3.connect(COMPUTED_DB)
-    cursor = conn.cursor()
-    cursor.execute(f"DROP TABLE IF EXISTS {table_name};")
-    original_columns = list(json_data[0].keys())
-    sanitized_columns = []
-    for col in original_columns:
-        new_col = col.replace(":", "_")
-        if new_col and new_col[0].isdigit():
-            new_col = "_" + new_col
-        sanitized_columns.append(new_col)
-    def get_col_type(val):
-        if isinstance(val, pd.Timestamp):
-            return "TEXT"
-        return "REAL" if isinstance(val, (int, float)) else "TEXT"
-    col_defs = ", ".join([f'"{sanitized_columns[i]}" {get_col_type(json_data[0][original_columns[i]])}'
-                          for i in range(len(original_columns))])
-    create_table_query = f"CREATE TABLE {table_name} ({col_defs});"
-    cursor.execute(create_table_query)
-    placeholders = ", ".join(["?"] * len(sanitized_columns))
-    cols = ", ".join('"' + col + '"' for col in sanitized_columns)
-    insert_query = f"INSERT INTO {table_name} ({cols}) VALUES ({placeholders});"
-    for row in json_data:
-        values = [str(row[col]) if isinstance(row[col], pd.Timestamp) else row[col] for col in original_columns]
-        cursor.execute(insert_query, values)
-    conn.commit()
-    conn.close()
-    st.success(f"✅ Computed data saved to SQLite table '{table_name}'.")
-
-def compute_statistics_and_save(df: pd.DataFrame, file_id: str, selected_fields: List[str] = None) -> List[dict]:
-    if "REPORT_DATE" not in df.columns:
-        st.error("REPORT_DATE column not found in the dataset!")
-        return []
-    df["REPORT_DATE"] = pd.to_datetime(df["REPORT_DATE"], errors='coerce')
-    # Determine selected numeric fields: use provided list or alias mapping if available; else auto-detect numeric columns
-    if selected_fields is None:
-        selected_fields = list(alias_mapping.values()) if alias_mapping else list(df.select_dtypes(include=[np.number]).columns)
-    # Clean the selected columns
-    for col in selected_fields:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(',', '', regex=True)
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    agg_funcs = {col: ['sum', 'mean', 'min', 'max', 'std'] for col in selected_fields if col in df.columns}
-    df_stats = df.groupby('REPORT_DATE').agg(agg_funcs)
-    df_stats.columns = ['_'.join(col) for col in df_stats.columns]
-    df_stats.reset_index(inplace=True)
-    stats_json = df_stats.to_dict(orient="records")
-    # Sanitize each record for JSON serialization
-    stats_json = [sanitize_record(record) for record in stats_json]
-    json_filename = f"aggregated_stats_{file_id}.json"
-    with open(json_filename, "w") as f:
-        json.dump(stats_json, f, default=str, indent=2)
-    st.success(f"Aggregated statistics saved to {json_filename}")
-    print(stats_json)
-    return stats_json
-
-selected_fields_ui = None
-
-
-
-def sanitize_record(record: dict) -> dict:
-    sanitized = {}
-    for k, v in record.items():
-        if isinstance(v, pd.Timestamp):
-            sanitized[k] = str(v)
-        else:
-            sanitized[k] = v
-    return sanitized
-
-def store_computed_embeddings(json_data, table_name="computed_embeddings"):
-    if not json_data:
-        st.warning("No computed data available to store embeddings.")
-        return
-    conn = sqlite3.connect(COMPUTED_DB)
-    cursor = conn.cursor()
-    cursor.execute(f"DROP TABLE IF EXISTS {table_name};")
-    cursor.execute(f"""
-        CREATE TABLE {table_name} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            json_data TEXT,
-            embedding BLOB
-        );
-    """)
-    texts = []
-    debug_expander = st.expander("Debug: Raw computed records")
-    for record in json_data:
-        try:
-            sanitized = sanitize_record(record)
-            text = json.dumps(sanitized)
-            texts.append(text)
-        except Exception as e:
-            debug_expander.error(f"Error serializing record: {record}\nError: {e}")
-    if not texts:
-        st.error("No records could be serialized for embedding.")
-        return
-    successful_texts = []
-    successful_embeddings = []
-    for text in texts:
-        try:
-            approx_tokens = len(text.split())
-            if approx_tokens > 3000:
-                st.warning(f"Record is very long (approx {approx_tokens} tokens). Attempting to embed. Preview: {text[:200]}...")
-            response = client.embeddings.create(model=EMBEDDING_MODEL, input=[text])
-            embedding = np.array(response.data[0].embedding, dtype='float32')
-            successful_texts.append(text)
-            successful_embeddings.append(embedding)
-        except Exception as e:
-            st.error(f"Error embedding text (length {len(text)} chars): {text[:200]}...\nError: {e}")
-    for text, emb in zip(successful_texts, successful_embeddings):
-        blob = emb.tobytes()
-        cursor.execute(f"INSERT INTO {table_name} (json_data, embedding) VALUES (?, ?)", (text, blob))
-    conn.commit()
-    conn.close()
-    st.success(f"Computed embeddings stored in SQLite table '{table_name}'.")
-
-def create_vector_embedings(bucket_name):
-        try:
-            s3 = boto3.client("s3", aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
-            objects = s3.list_objects_v2(Bucket=bucket_name).get("Contents", [])
-
-            computed_stats_json.clear()
-            for obj in objects:
-                filename = obj["Key"]
-                if not filename.lower().endswith(".csv"):
-                    continue
-                try:
-                    s3.download_file(bucket_name, filename, filename)
-                    df = pd.read_csv(filename)
-                    if df.empty or df.columns.size == 0:
-                        continue
-                    df.columns = df.columns.str.strip().str.upper()
-                    if "REPORT_DATE" in df.columns:
-                        df["REPORT_DATE"] = pd.to_datetime(df["REPORT_DATE"], errors='coerce').dt.strftime('%Y-%m-%d')
-                    # Compute aggregated statistics using selected numeric fields
-                    stats = compute_statistics_and_save(df, filename, selected_fields=selected_fields_ui)
-                    if stats:
-                        computed_stats_json.extend(stats)
-                    save_computed_data_to_sqlite(stats, table_name="computed_data")
-                    # Only store embeddings for computed aggregated statistics (no raw data embeddings)
-                    store_computed_embeddings(stats, table_name="computed_embeddings")
-                except Exception as e:
-                    st.error(f"❌ Error processing {filename}: {e}")
-        except Exception as e:
-            st.error(f"❌ S3 Processing Error: {e}")
-
-def search_computed_data(query: str, top_k=2) -> List[Tuple[str, float]]:
-    q_embed = client.embeddings.create(model=EMBEDDING_MODEL, input=[query]).data[0].embedding
-    q_vec = np.array(q_embed, dtype='float32').reshape(1, -1)
-    conn = sqlite3.connect(COMPUTED_DB)
-    cursor = conn.cursor()
-    cursor.execute("SELECT json_data, embedding FROM computed_embeddings")
-    rows = cursor.fetchall()
-    conn.close()
-    computed_texts = []
-    computed_embeddings = []
-    for row in rows:
-        text = row[0]
-        emb_array = np.frombuffer(row[1], dtype='float32')
-        computed_texts.append(text)
-        computed_embeddings.append(emb_array)
-    if not computed_embeddings:
-        st.error("No computed embeddings available for search. Please process some data first.")
-        return []
-    sims = cosine_similarity(q_vec, np.vstack(computed_embeddings))[0]
-    top_indices = np.argsort(sims)[::-1][:top_k]
-    return [(computed_texts[i], sims[i]) for i in top_indices]
-
-def trim_context(text: str, max_chars: int = 3000) -> str:
-    if len(text) > max_chars:
-        return text[:max_chars] + "\n...[TRUNCATED]"
-    return text
-
-
-def add_feedback_log(query, responce):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    user_reaction = 1
-
-    cursor.execute('''
-        INSERT INTO feedback_log (user_query,query_responce,user_reaction)
-        VALUES (?, ?, ?)
-    ''', ( query, responce, user_reaction ))
-
-    log_id = cursor.lastrowid
-
-    conn.commit()
-    conn.close()
-
-    return log_id
-
-def update_feedback_log(reaction, user_feedback, log_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    user_reaction = 1 if reaction == "👍 Yes" else 0
-
-    cursor.execute('''
-    UPDATE feedback_log
-    SET user_reaction = ?, user_feedback = ?
-    WHERE id = ?
-    ''', (user_reaction,user_feedback, log_id))
-
-    conn.commit()
-    conn.close()
-
-#######Graph Query for Co2, NG, PW ###############
-
-#######Start here ##################
-
-def plot_graph_based_on_prompt_all(prompt, category_key):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_name, json_contents FROM file_tracking WHERE is_processed = 1")
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        st.warning("⚠️ No processed JSON data found in the database.")
-        return
-
-    categories = {
-        "CO2": ['VOLUME', 'TRDVAL', 'MKTVAL', 'TRDPRC'],
-        "Natural Gas": ['VOLUME', 'VOLUME_TOTAL', 'QTY_PHY', 'MKT_VAL', 'QTY_FIN', 'TRD_VAL'],
-        "Power": [
-            'VOLUME_BL', 'VOLUME_PK', 'VOLUME_OFPK',
-            'MKT_VAL_BL', 'MKT_VAL_PK', 'MKT_VAL_OFPK',
-            'TRD_VAL_BL', 'TRD_VAL_PK', 'TRD_VAL_OFPK'
-        ]
-    }
-
-    if category_key not in categories:
-        st.error("❌ Invalid category selected.")
-        return
-
-    fields_to_plot = categories[category_key]
-
-    data = []
-    for file_name, json_text in rows:
-        if category_key.replace(" ", "").lower() not in file_name.replace("_", "").lower():
-            continue
-        try:
-            json_data = json.loads(json_text)
-            if "daily_totals" in json_data:
-                data.extend(json_data["daily_totals"])
-        except Exception as e:
-            st.error(f"⚠️ Error reading {file_name}: {e}")
-
-    if not data:
-        st.error(f"❌ No valid 'daily_totals' data found for {category_key}.")
-        return
-
-    df_graph = pd.DataFrame(data)
-    if 'REPORT_DATE' not in df_graph.columns:
-        st.error("❌ REPORT_DATE column missing in JSON data.")
-        return
-
-    df_graph['REPORT_DATE'] = pd.to_datetime(df_graph['REPORT_DATE'])
-
-    plt.figure(figsize=(14, 7))
-    found_any = False
-    for field in fields_to_plot:
-        if field.lower() in prompt.lower() and field in df_graph.columns:
-            plt.bar(df_graph['REPORT_DATE'], df_graph[field], label=field, alpha=0.6)
-            found_any = True
-
-    if not found_any:
-        for field in fields_to_plot:
-            if field in df_graph.columns:
-                plt.bar(df_graph['REPORT_DATE'], df_graph[field], label=field, alpha=0.6)
-                found_any = True
-
-    if not found_any:
-        st.error(f"❌ None of the expected fields were found for {category_key}.")
-        return
-
-    plt.xlabel('Report Date')
-    plt.ylabel('Values')
-    plt.title(f"{category_key} - Daily Aggregated Values")
-    plt.xticks(rotation=45)
-    plt.legend()
-    st.pyplot(plt)
-
-####End here ####
-
-def plot_graph_based_on_prompt(prompt):
-    # Connect to SQLite
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_name, json_contents FROM file_tracking WHERE is_processed = 1")
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        st.warning("⚠️ No processed JSON data found in the database.")
-        return
-
-    # Extract JSON data into a list
-    data = []
-    for file_name, json_text in rows:
-        try:
-            json_data = json.loads(json_text)
-
-            # Extract only the 'daily_totals' section
-            if "daily_totals" in json_data:
-                data.extend(json_data["daily_totals"])
+        # Choose one of the three main AI agents
+        main_agent = st.radio("📌 Select AI Agent",
+                             ["Data Management AI Agent", "RAG AI Agent", "Application AI Agent"],
+                             key="main_agent")
+
+        # Show appropriate submenu based on main agent selection
+        if main_agent == "Data Management AI Agent":
+            dm_submenu = st.radio("📂 Select Data Task",
+                                ["Pipeline Dashboard", "Data Pipeline", "Processed Data"],
+                                key="dm_radio")
+
+        elif main_agent == "RAG AI Agent":
+            submenu = st.radio("📂 Select RAG Task",
+                              ["Dashboard", "Configure & Upload", "Fine Tuning", "Settings"],
+                              key="rag_radio")
+
+        elif main_agent == "Application AI Agent":
+            app_submenu = st.radio("📂 Select Application Task",
+                              ["Defect Analysis", "Root Cause Analysis", "Analysis History", "Defect Classifier","User Feedback"],
+                               key="app_radio")
+
+     # --- Main Page Content ---
+     ## Only show content for the currently selected main agent
+    if main_agent == "Data Management AI Agent":
+        if dm_submenu == "Pipeline Dashboard":
+            st.header("📊 Data Pipeline Dashboard")
+            if st.session_state.processed_data is not None:
+                st.dataframe(st.session_state.processed_data.head())
             else:
-                st.error(f"❌ 'daily_totals' not found in {file_name}.")
-                return
-        except Exception as e:
-            st.error(f"⚠️ Error reading JSON from {file_name}: {e}")
-            return
-
-    # Convert the extracted data to a DataFrame
-    if not data:
-        st.error("❌ No valid JSON data found.")
-        return
-
-    df_graph = pd.DataFrame(data)
-
-    # Ensure REPORT_DATE exists and convert to datetime
-    if 'REPORT_DATE' in df_graph.columns:
-        df_graph['REPORT_DATE'] = pd.to_datetime(df_graph['REPORT_DATE'])
-    else:
-        st.error("❌ REPORT_DATE column not found in the JSON data.")
-        return
-
-    # Define valid columns
-    valid_columns = {
-        "volume": "TOTAL_VOLUME",
-        "trdval": "TOTAL_TRDVAL",
-        "mktval": "TOTAL_MKTVAL",
-        "trdprc": "TOTAL_TRDPRC"
-    }
-
-    # Plot the requested column
-    for key, column in valid_columns.items():
-        if key in prompt.lower():
-            if column not in df_graph.columns:
-                st.error(f"❌ Column '{column}' not found in the JSON data.")
-                return
-
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.bar(df_graph['REPORT_DATE'], df_graph[column], color='blue')
-            ax.set_xlabel('Report Date')
-            ax.set_ylabel(column)
-            ax.set_title(f'{column} Over Time')
-            plt.xticks(rotation=45)
-
-            # Display the graph in Streamlit
-            st.pyplot(fig)
-            return
-
-    st.error("❌ Could not detect a valid column in your query. Try mentioning Volume, TRDVAL, MKTVAL, or TRDPRC.")
-
-
-
-# -------------------------------
-# Single Combined Bar Chart CO2
-# -------------------------------
-def plot_combined_graph_CO2():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_name, json_contents FROM file_tracking WHERE is_processed = 1 AND file_name LIKE 'NOP_CO2%'")
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        print("⚠️ No CO2 files found in the tracking database.")
-        return
-
-    data = []
-    for file_name, json_text in rows:
-        try:
-            json_data = json.loads(json_text)
-            if "daily_totals" in json_data:
-                data.extend(json_data["daily_totals"])
-        except Exception as e:
-            print(f"⚠️ Error reading {file_name}: {e}")
-
-    if not data:
-        print("❌ No valid 'daily_totals' found in CO2 files.")
-        return
-
-    df_graph = pd.DataFrame(data)
-
-    if 'REPORT_DATE' not in df_graph.columns:
-        print("❌ REPORT_DATE column missing in CO2 JSON data.")
-        return
-
-    df_graph['REPORT_DATE'] = pd.to_datetime(df_graph['REPORT_DATE'])
-
-    plt.figure(figsize=(12, 6))
-    plt.bar(df_graph['REPORT_DATE'], df_graph['TOTAL_VOLUME'], label='Total Volume', alpha=0.6)
-    plt.bar(df_graph['REPORT_DATE'], df_graph['TOTAL_TRDVAL'], label='Total TRDVAL', alpha=0.6)
-    plt.bar(df_graph['REPORT_DATE'], df_graph['TOTAL_MKTVAL'], label='Total MKTVAL', alpha=0.6)
-    plt.bar(df_graph['REPORT_DATE'], df_graph['TOTAL_TRDPRC'], label='Total TRDPRC', alpha=0.6)
-    plt.xlabel('Report Date')
-    plt.ylabel('Values')
-    plt.title('CO2: Comparison of Volume, TRDVAL, MKTVAL, and TRDPRC')
-    plt.xticks(rotation=45)
-    plt.legend()
-    plt.show()
-
-# -------------------------------
-# Combined Graph for NG Files
-# -------------------------------
-
-def plot_combined_graph_NG():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_name, json_contents FROM file_tracking WHERE is_processed = 1 AND file_name LIKE 'NOP_NG%'")
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        print("⚠️ No NG files found in the tracking database.")
-        return
-
-    data = []
-    for file_name, json_text in rows:
-        try:
-            json_data = json.loads(json_text)
-            if "daily_totals" in json_data:
-                data.extend(json_data["daily_totals"])
-        except Exception as e:
-            print(f"⚠️ Error reading {file_name}: {e}")
-
-    if not data:
-        print("❌ No valid 'daily_totals' found in NG files.")
-        return
-
-    df_graph = pd.DataFrame(data)
-
-    if 'REPORT_DATE' not in df_graph.columns:
-        print("❌ REPORT_DATE column missing in NG JSON data.")
-        return
-
-    df_graph['REPORT_DATE'] = pd.to_datetime(df_graph['REPORT_DATE'])
-
-    plt.figure(figsize=(12, 6))
-    fields = ['VOLUME', 'VOLUME_TOTAL', 'QTY_PHY', 'MKT_VAL', 'QTY_FIN', 'TRD_VAL']
-    for field in fields:
-        if field in df_graph.columns:
-            plt.bar(df_graph['REPORT_DATE'], df_graph[field], label=field, alpha=0.6)
-
-    plt.xlabel('Report Date')
-    plt.ylabel('Values')
-    plt.title('NG: Comparison of Volume, Qty, TRD_VAL, MKT_VAL')
-    plt.xticks(rotation=45)
-    plt.legend()
-    plt.show()
-
-# -------------------------------
-# Single Combined Bar Chart PW
-# -------------------------------
-def plot_combined_graph_PW():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT file_name, json_contents FROM file_tracking WHERE is_processed = 1 AND file_name LIKE 'NOP_PW%'")
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        print("⚠️ No PW files found in the tracking database.")
-        return
-
-    data = []
-    for file_name, json_text in rows:
-        try:
-            json_data = json.loads(json_text)
-            if "daily_totals" in json_data:
-                data.extend(json_data["daily_totals"])
-        except Exception as e:
-            print(f"⚠️ Error reading {file_name}: {e}")
-
-    if not data:
-        print("❌ No valid 'daily_totals' found in PW files.")
-        return
-
-    df_graph = pd.DataFrame(data)
-
-    if 'REPORT_DATE' not in df_graph.columns:
-        print("❌ REPORT_DATE column missing in PW JSON data.")
-        return
-
-    df_graph['REPORT_DATE'] = pd.to_datetime(df_graph['REPORT_DATE'])
-
-    plt.figure(figsize=(14, 7))
-    fields = [
-        'VOLUME_BL', 'VOLUME_PK', 'VOLUME_OFPK',
-        'MKT_VAL_BL', 'MKT_VAL_PK', 'MKT_VAL_OFPK',
-        'TRD_VAL_BL', 'TRD_VAL_PK', 'TRD_VAL_OFPK'
-    ]
-    for field in fields:
-        if field in df_graph.columns:
-            plt.bar(df_graph['REPORT_DATE'], df_graph[field], label=field, alpha=0.6)
-
-    plt.xlabel('Report Date')
-    plt.ylabel('Values')
-    plt.title('PW: Comparison of Volume, MKT_VAL, TRD_VAL across types')
-    plt.xticks(rotation=45)
-    plt.legend()
-    plt.show()
-
-
-
-
-
-def get_feedback_logs():
-    conn = sqlite3.connect(DB_NAME)
-    query = """
-    SELECT
-        id,
-        user_query,
-        query_responce,
-        user_reaction,
-        user_feedback,
-        created_at
-    FROM feedback_log
-    """
-    feedback_df = pd.read_sql_query(query, conn)
-    conn.close()
-
-    # Map user_reaction to readable feedback
-    feedback_df["User Feedback"] = feedback_df["user_reaction"].apply(lambda x: "👍 Yes" if x == 1 else "👎 No")
-    feedback_df["Timestamp"] = pd.to_datetime(feedback_df["created_at"])
-    return feedback_df
-
-# --- Main App ---
-
-# --- User Authentication ---
-if not st.session_state['logged_in']:
-  col1, col2, col3 = st.columns([1, 2, 1])
-
-  with col2:
-
-      # --- Logo Section ---
-      col1, col2, col3 = st.columns(3)
-
-      with col1:
-            st.write(' ')
-
-      with col2:
-          st.image("https://img1.wsimg.com/isteam/ip/495c53b7-d765-476a-99bd-58ecde467494/blob-411e887.png/:/rs=w:127,h:95,cg:true,m/cr=w:127,h:95/qt=q:95", width=150)
-
-      with col3:
-            st.write(' ')
-
-
-      st.title("🔐 Welcome to ETAI Energey Trading AI Platform")
-
-      tab1, tab2 = st.tabs(["Login", "Register"])
-
-      with tab1:
-              st.header("🔑 Login")
-              username = st.text_input("Username", key="Username", placeholder="Enter your username")
-              password = st.text_input("Password", type="password", key="password", placeholder="Enter your password")
-
-              if st.button("Login", use_container_width=True,key="login", help="Click to login"):
-                  if authenticate_user(username, password):
-                      st.success("✅ Login successful!")
-                      st.session_state['logged_in'] = True
-                      st.session_state['username'] = username
-                      st.rerun()
-                  else:
-                      st.error("❌ Invalid username or password.")
-
-      with tab2:
-              st.header("📝 Register")
-              new_username = st.text_input("New Username")
-              new_password = st.text_input("New Password", type="password")
-
-              if st.button("Register", use_container_width=True):
-                  if register_user(new_username, new_password):
-                      st.success("✅ User registered successfully!")
-                  else:
-                      st.error("❌ Username already exists. Choose a different one.")
-
-# --- Dashboard ---
-else:
-    sidebar_menu()
-    top_right_menu()
-
-    # --- Main Content Section ---
-    st.title(f"📊 {st.session_state.main_section}")
-
-    # Display content dynamically based on selected section
-    if st.session_state.sub_section == "Pipeline Dashboard":
-        st.subheader("📈 Pipeline Dashboard")
-
-    elif st.session_state.sub_section == "Data Pipeline":
-        st.subheader("🔧 Data Pipeline -> Energy Training")
-        st.write("Upload and manage your data files efficiently.")
-
-        st.markdown("---")
-
-        # --- Section 1: Raw Data Upload ---
-        st.markdown("### 🗂️ CO2 Data Upload")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            metadata_file1 = st.file_uploader("Upload Schema File (CSV)", type=["csv"], key="metadata_file1")
-
-        with col2:
-            raw_files1 = st.file_uploader("Upload Raw Data (CSV)", type=["csv"], key="raw_files1", accept_multiple_files=True)
-
-        if metadata_file1:
-            try:
-                metadata_df = pd.read_csv(BytesIO(metadata_file1.getvalue()))
-                # Process metadata to create alias mapping; assumes metadata CSV has columns 'Column' and 'Description'
-                alias_mapping = process_metadata_alias(metadata_df)
-                st.success("✅ Metadata processed successfully!")
-                st.write("Alias Mapping:")
-                st.code("\n".join([f"{desc} -> {col}" for desc, col in alias_mapping.items()]))
-            except Exception as e:
-                st.error(f"❌ Error processing metadata: {e}")
-
-        # Submit button logic
-        if st.button("Submit", key="co2"):
-            if metadata_file1 and raw_files1:
-                try:
-                  if metadata_file1 and raw_files1:
-                      metadata_df = pd.read_csv(BytesIO(metadata_file1.getvalue()))
-                      for f in raw_files1:
-                          f.seek(0)
-                          df = pd.read_csv(f)
-                          file_name = f.name
-
-                          if validate_against_metadata(df, metadata_df, file_name):
-                              f.seek(0)  # Reset pointer before re-using for upload
-                              success, msg = upload_to_s3(f, file_name, VALID_BUCKET)
-                              st.success(f"✅ VALID: {file_name} | {msg}")
-                          else:
-                              f.seek(0)
-                              success, msg = upload_to_s3(f, file_name, REJECTED_BUCKET)
-                              st.error(f"❌ INVALID: {file_name} | {msg}")
-
-                except Exception as e:
-                    st.error(f"❌ Error during submission: {e}")
-            else:
-                st.warning("⚠️ Please upload metadata and data files!")
-
-        st.markdown("---")
-
-        # --- Section 2: Processed Data Upload ---
-        st.markdown("### 🔥 Natural Gas Data Upload")
-
-        col3, col4 = st.columns(2)
-
-        with col3:
-            metadata_file2 = st.file_uploader("Upload Schema File (CSV)", type=["csv"], key="metadata_file2")
-
-        with col4:
-            raw_files2 = st.file_uploader("Upload Raw Data (CSV)", type=["csv"], key="raw_files2", accept_multiple_files=True)
-
-        if metadata_file2:
-            try:
-                metadata_df = pd.read_csv(BytesIO(metadata_file2.getvalue()))
-                # Process metadata to create alias mapping; assumes metadata CSV has columns 'Column' and 'Description'
-                alias_mapping = process_metadata_alias(metadata_df)
-                st.success("✅ Metadata processed successfully!")
-                st.write("Alias Mapping:")
-                st.code("\n".join([f"{desc} -> {col}" for desc, col in alias_mapping.items()]))
-            except Exception as e:
-                st.error(f"❌ Error processing metadata: {e}")
-
-        # Submit button logic
-        if st.button("Submit", key="ng"):
-            if metadata_file2 and raw_files2:
-                try:
-                  if metadata_file2 and raw_files2:
-                      metadata_df = pd.read_csv(BytesIO(metadata_file2.getvalue()))
-                      for f in raw_files2:
-                          f.seek(0)
-                          df = pd.read_csv(f)
-                          file_name = f.name
-
-                          if validate_against_metadata(df, metadata_df, file_name):
-                              f.seek(0)  # Reset pointer before re-using for upload
-                              success, msg = upload_to_s3(f, file_name, VALID_BUCKET)
-                              st.success(f"✅ VALID: {file_name} | {msg}")
-                          else:
-                              f.seek(0)
-                              success, msg = upload_to_s3(f, file_name, REJECTED_BUCKET)
-                              st.error(f"❌ INVALID: {file_name} | {msg}")
-
-                except Exception as e:
-                    st.error(f"❌ Error during submission: {e}")
-            else:
-                st.warning("⚠️ Please upload metadata and data files!")
-
-        st.markdown("---")
-
-        # --- Section 3: Model Output Upload ---
-        st.markdown("### 🚀 Power Data Upload")
-
-        col5, col6 = st.columns(2)
-
-        with col5:
-            metadata_file3 = st.file_uploader("Upload Schema File (CSV)", type=["csv"], key="metadata_file3")
-
-
-        with col6:
-            raw_files3 = st.file_uploader("Upload Raw Data (CSV)", type=["csv"], key="raw_files3", accept_multiple_files=True)
-
-        if metadata_file3:
-            try:
-                metadata_df = pd.read_csv(BytesIO(metadata_file3.getvalue()))
-                # Process metadata to create alias mapping; assumes metadata CSV has columns 'Column' and 'Description'
-                alias_mapping = process_metadata_alias(metadata_df)
-                st.success("✅ Metadata processed successfully!")
-                st.write("Alias Mapping:")
-                st.code("\n".join([f"{desc} -> {col}" for desc, col in alias_mapping.items()]))
-            except Exception as e:
-                st.error(f"❌ Error processing metadata: {e}")
-
-        # Submit button logic
-        if st.button("Submit", key="po"):
-            if metadata_file3 and raw_files3:
-                try:
-                  if metadata_file3 and raw_files3:
-                      metadata_df = pd.read_csv(BytesIO(metadata_file3.getvalue()))
-                      for f in raw_files3:
-                          f.seek(0)
-                          df = pd.read_csv(f)
-                          file_name = f.name
-
-                          if validate_against_metadata(df, metadata_df, file_name):
-                              f.seek(0)  # Reset pointer before re-using for upload
-                              success, msg = upload_to_s3(f, file_name, VALID_BUCKET)
-                              st.success(f"✅ VALID: {file_name} | {msg}")
-                          else:
-                              f.seek(0)
-                              success, msg = upload_to_s3(f, file_name, REJECTED_BUCKET)
-                              st.error(f"❌ INVALID: {file_name} | {msg}")
-
-                except Exception as e:
-                    st.error(f"❌ Error during submission: {e}")
-            else:
-                st.warning("⚠️ Please upload metadata and data files!")
-
-        st.markdown("---")
-
-    elif st.session_state.sub_section == "Processed Data":
-        st.subheader("📊 Processed Data")
-        st.write("Access and analyze the processed data records.")
-
-    elif st.session_state.sub_section == "Dashboard":
-        st.subheader("📚 Dashboard")
-        st.write("Manage vector embeddings and storage.")
-
-    elif st.session_state.sub_section == "Configure & Upload":
-        st.subheader("🏗️ Configure & Upload Data")
-
-        prefix_fields = {
-            "CO2": ['VOLUME', 'TRDVAL', 'MKTVAL', 'TRDPRC'],
-            "Natural Gas": ['VOLUME',	'VOLUME_TOTAL',	'QTY_PHY','MKT_VAL' ,'QTY_FIN','TRD_VAL'],
-            "Power": ['VOLUME_BL',	'VOLUME_PK',	'VOLUME_OFPK',	'MKT_VAL_BL',	'MKT_VAL_PK',	'MKT_VAL_OFPK',	'TRD_VAL_BL',	'TRD_VAL_PK',	'TRD_VAL_OFPK']
-        }
-
-        name = st.text_input("RAG  Agent Name")
-        col1, col2 = st.columns(2)
-        with col1:
-          bucket = st.selectbox("Select Bucket Name(S3)", ["etrm-etai-poc", "etrm-etai-poc-ng"])
-        with col2:
-          prefix = st.selectbox("Select Prefix", list(prefix_fields.keys()), index=0)
-
-        col3, col4 = st.columns(2)
-        with col3:
-            model = st.selectbox("Model", ["OpenAI GPT-3.5", "OpenAI GPT-4", "Llama 2", "Claude 3.5", "Claude 4" ,"Custom Model"])
-        with col4:
-            temp = st.slider("Temperature (Creativity)", 0.0, 1.0, 0.7, 0.1)
-
-        col5, col6 = st.columns(2)
-        with col5:
-             metadata_file = st.file_uploader("Upload Data Dictionary (CSV)", type=["csv"])
-
-        with col6:
-             uploaded_file = st.file_uploader("Upload Transaction Log (TXT, PDF, CSV, DOCX)", type=["txt", "pdf", "csv", "docx"])
-
-        prompt = st.text_area("📝 Provide Prompt Instructions", key='prompt')
-
-        if st.button("Submit & Process Data"):
-
-            if prefix == 'CO2':
-                prefix_value = "CO2"
-            elif prefix == 'Natural Gas':
-                prefix_value = "NG"
-            elif prefix == 'Power':
-                prefix_value = "PW"
-            else:
-                prefix_value = "misc"
-            process_files_from_s3_folder(VALID_BUCKET, prefix_value)
-            add_agent_detail(name, model, temp, prompt)
-            #create_vector_embedings(bucket)
-
-
-    elif st.session_state.sub_section == "Fine Tuning":
-        st.subheader("📄 Fine Tuning")
-
-    elif st.session_state.sub_section == "Settings":
-        st.subheader("🚀 Settings")
-        st.write("Get insights into your application's performance.")
-
-    elif st.session_state.sub_section == "Energy Tradeing Analysis":
-
-        if "query_answer" not in st.session_state:
-            st.session_state["query_answer"] = None
-        if "feedback_submitted" not in st.session_state:
-            st.session_state["feedback_submitted"] = False
-
-        st.subheader("📊 Energy Tradeing Analysis")
-        st.write("💬 Ask Your Financial or Commodity Question")
-        user_query = st.text_input("Example: What is the total Price Value on 13 Nov 2024?")
-        query_answer= None
-        if st.button("Submit Query") and user_query:
-          with st.spinner("Thinking..."):
-              query_answer = query_sqlite_json_with_openai(user_query)
-
-              st.success(query_answer)
-              log_id = add_feedback_log(user_query, query_answer)
-              # Store the answer in session state to persist it
-              st.session_state["query_answer"] = query_answer
-              st.session_state["log_id"] = log_id
-              st.session_state["feedback_submitted"] = False
-
-      # Display feedback section only if query is answered
-        if st.session_state["query_answer"]:
-            feedback = st.radio("Did the AI answer your question correctly?:", ["👍 Yes", "👎 No"], key="feedback_radio", horizontal=True)
-            feedback_comment = st.text_area("Additional comments or corrections:", height=100, key="feedback_comment")
-
-            # Feedback submission
-            if st.button("Submit Feedback"):
-                if not feedback_comment.strip():
-                    st.warning("Please add comments or corrections before submitting.")
+                st.info("No processed data available yet.")
+        elif dm_submenu == "Data Pipeline":
+            st.header("🛠️ AI Data Processing Pipeline")
+            data_file = st.file_uploader("📂 Upload Data File (CSV)", type=["csv"], key="data_pipeline_file")
+            metadata_file = st.file_uploader("📜 Upload Metadata File (CSV or JSON)", type=["csv", "json"], key="metadata_pipeline_file")
+            if st.button("🔄 Process Data"):
+                if data_file is None or metadata_file is None:
+                    st.error("❌ Please upload both data and metadata files!")
                 else:
-                    # Avoid multiple submissions with session state
-                    if not st.session_state["feedback_submitted"]:
-
-                        update_feedback_log(feedback, feedback_comment, st.session_state["log_id"])
-                        st.session_state["feedback_submitted"] = True
-                        st.success("✅ Feedback submitted successfully!")
+                    data_df = load_data_file(data_file)
+                    load_pipeline_metadata_file(metadata_file)
+                    if data_df is not None and st.session_state.metadata_dict:
+                         # Map columns using the metadata
+                        column_mapping = map_columns_with_llm(data_df.columns, st.session_state.metadata_dict)
+                        data_df.rename(columns=column_mapping, inplace=True)
+                         # Deduplicate column names if needed
+                        data_df.columns = pd.io.common.dedup_names(list(data_df.columns), is_potential_multiindex=False)
+                        st.session_state.processed_data = data_df.copy()
+                        st.success("✅ Processed data stored successfully!")
+                         # Store metadata in FAISS vector DB
+                        store_metadata_in_vector_db(st.session_state.metadata_dict)
+                        st.rerun()
+        elif dm_submenu == "Processed Data":
+            st.header("📊 Processed Data Insights")
+            if st.session_state.processed_data is None:
+                st.warning("No processed data available. Run the pipeline first.")
+            else:
+                st.dataframe(st.session_state.processed_data.head())
+                if st.session_state.metadata_dict:
+                    column_mapping_df = pd.DataFrame(list(st.session_state.metadata_dict.items()),
+                                                    columns=["Field Name", "Description"])
+                    st.dataframe(column_mapping_df)
+                query = st.text_input("Enter field name to lookup:", key="metadata_lookup")
+                if st.button("🔎 Search Metadata"):
+                    if query in st.session_state.metadata_dict:
+                        st.success(f"📌 {query}: {st.session_state.metadata_dict[query]}")
                     else:
-                        st.info("Feedback already submitted.")
+                        st.warning("⚠️ Field not found in metadata.")
 
-    elif st.session_state.sub_section == "Graph Query":
-        st.subheader("📊 Graph Query")
-        category_selected = st.selectbox("Select Category", ["CO2", "Natural Gas", "Power"])
-        graph_query_input = st.text_input('Ask for a bar graph (e.g., "Show bar graph for TRDVAL")')
-        if st.button('Generate Custom Graph'):
-            plot_graph_based_on_prompt_all(graph_query_input, category_selected)
+    elif main_agent == "RAG AI Agent":
+        if submenu == "Dashboard":
+            st.header("🚀 RAG AI Agent Dashboard")
+            st.write("Monitor key metrics and insights from your analysis.")
+            if st.session_state.feedback_logs:
+                feedback_df = pd.DataFrame(st.session_state.feedback_logs)
+                st.subheader("📊 User Feedback Insights")
+                st.dataframe(feedback_df)
+        elif submenu == "Configure & Upload":
+            st.header("🏗️ Configure & Upload Data")
+            uploaded_file = st.file_uploader("Upload Defect Log (TXT, PDF, CSV, DOCX)", type=["txt", "pdf", "csv", "docx"])
+            metadata_file = st.file_uploader("Upload Metadata File (CSV)", type="csv")
+            prompt_instruction = st.text_area("📝 Provide Prompt Instructions", value=st.session_state.prompt_instruction)
+            if st.button("Submit & Process Data"):
+                if uploaded_file:
+                    st.session_state.source_document_name = uploaded_file.name
+                    file_extension = uploaded_file.name.split(".")[-1].lower()
+                    with st.spinner("Processing data..."):
+                        for i in range(100):
+                            time.sleep(0.01)
+                        text_data = extract_text_from_file(uploaded_file, file_extension)
+                        if text_data:
+                            documents = [Document(page_content=line) for line in text_data]
+                            embedding_model = OpenAIEmbeddings()
+                            ector_store = LC_FAISS.from_documents(documents, embedding_model)
+                            retriever = vector_store.as_retriever()
+                            llm = OpenAI()
+                            qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
+                            st.session_state.retriever = retriever
+                            st.session_state.qa_chain = qa_chain
+                            st.session_state.prompt_instruction = prompt_instruction
+                            st.success("✅ Data successfully stored in FAISS. Ready for analysis!")
+                        else:
+                            st.error("❌ Could not extract text from the uploaded file.")
+                if metadata_file:
+                    load_metadata_file(metadata_file)
+        elif submenu == "Fine Tuning":
+            st.header("🛠️ Fine Tune Model")
+            try:
+                with open("training_data.json", "r") as f:
+                    training_data = json.load(f)
+                num_examples = len(training_data)
+            except (FileNotFoundError, json.JSONDecodeError):
+                training_data = []
+                num_examples = 0
+            st.subheader("📊 Training Data Summary")
+            if num_examples > 0:
+                st.write(f"📝 **Available Training Examples:** {num_examples}")
+                for i in range(min(5, num_examples)):
+                    with st.expander(f"Example {i+1}"):
+                        st.write("**Original Query:**", training_data[i]['query'])
+                        st.write("**Original Response:**", training_data[i]['original_response'])
+                        st.write("**Improved Response:**", training_data[i]['improved_response'])
+                st.subheader("🧠 Fine-Tuning Options")
+                epochs = st.number_input("Training Epochs", min_value=1, max_value=10, value=3)
+                learning_rate = st.select_slider("Learning Rate", options=[0.00001, 0.0001, 0.001, 0.01], value=0.0001)
+                if st.button("Regenerate Training Data"):
+                    training_pairs = prepare_training_data(st.session_state.feedback_logs)
+                    num_pairs = save_training_data(training_pairs)
+                    st.success(f"✅ Successfully regenerated {num_pairs} training examples!")
+                    st.rerun()
+                if st.button("Start Fine-Tuning"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    for i in range(100):
+                        progress_bar.progress(i + 1)
+                        if i < 30:
+                            status_text.text(f"Preparing training data... ({i+1}%)")
+                        elif i < 80:
+                            status_text.text(f"Training model... ({i+1}%)")
+                        else:
+                            status_text.text(f"Evaluating and finalizing model... ({i+1}%)")
+                        time.sleep(0.05)
+                    status_text.text("Fine-tuning complete! Model has been updated.")
+                    st.success("✅ Model successfully fine-tuned with user feedback!")
+        elif submenu == "Settings":
+            st.header("⚙️ RAG AI Agent Settings")
+            col1, col2 = st.columns(2)
+            with col1:
+                model_choice = st.selectbox("Language Model", ["OpenAI GPT-3.5", "OpenAI GPT-4", "Custom Model"])
+            with col2:
+                temperature = st.slider("Temperature (Creativity)", 0.0, 1.0, 0.7, 0.1)
+            st.subheader("User Interface")
+            theme = st.radio("Color Theme", ["Light", "Dark", "System Default"])
+            if st.button("Save Settings"):
+                st.success("✅ Settings saved successfully!")
 
-        if st.button('Combined CO2 Graph'):
-            plot_combined_graph_CO2(graph_query_input)
-        if st.button('Combined NG Graph'):
-            plot_graph_based_on_prompt(graph_query_input)
-        if st.button('Combined PW Graph'):
-            plot_graph_based_on_prompt(graph_query_input)
+    elif main_agent == "Application AI Agent":
+        if app_submenu == "Defect Analysis":
+            st.header("📉 Defect Analysis")
+            if st.session_state.retriever is None:
+                st.info("👈 Please upload and process a defect log file first using the RAG AI Agent.")
+            else:
+                query = st.text_area("Enter Defect details to check for defects:", height=100,
+                                     placeholder="Example: Login fails with valid credentials, returning a 500 error from the backend service.",
+                                     value=st.session_state.query_input)
+                if st.button("Analyze Deviation") and query:
+                    feedback_data = load_feedback_data()
+                    faiss_index, feedback_data_indexed = create_faiss_index(feedback_data)
+                    feedback_insights = retrieve_feedback_insights(query, faiss_index, feedback_data_indexed)
+                    if feedback_insights:
+                        feedback_text = "\n".join(f"- {insight}" for insight in feedback_insights)
+                        composite_prompt = f"Based on feedback from similar cases:\n{feedback_text}\n\nNow, analyze the following transaction:\n{query}"
+                    else:
+                        composite_prompt = query
+                    response = st.session_state.qa_chain.invoke(f"{st.session_state.prompt_instruction}\n{composite_prompt}")
+                    base_analysis = response.get("result", f"Deviation detected in {query}.")
+                    st.session_state.analysis_result = base_analysis
+                    st.session_state.confidence_score = calculate_confidence_score(0.6, feedback_insights, response.get("source_documents", []))
+                    st.session_state.query_input = query
+                    st.session_state.deviation_logs.append({
+                         "Transaction Detail": query,
+                         "Analysis": base_analysis,
+                         "Source Document": st.session_state.source_document_name,
+                         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                     })
+                if st.session_state.analysis_result:
+                    st.subheader("Defect Analysis Result:")
+                    st.markdown(f'<div class="deviation-card">{st.session_state.analysis_result}</div>', unsafe_allow_html=True)
+                    st.subheader("Source Document:")
+                    st.markdown(f'<div class="deviation-card">{st.session_state.source_document_name}</div>', unsafe_allow_html=True)
+                    st.subheader("🧠 Confidence Score:")
+                    st.markdown(f'<div class="deviation-card">Confidence: {round(st.session_state.confidence_score * 100)}%</div>', unsafe_allow_html=True)
+                    st.subheader("Was this response helpful?")
+                    feedback = st.radio("Feedback:", ["👍 Yes", "👎 No"], key="feedback_radio", horizontal=True)
+                    feedback_comment = st.text_area("Additional comments or corrections:", height=100, key="feedback_comment")
+                    if st.button("Submit Feedback"):
+                        st.session_state.feedback_button_clicked = True
+                    if st.session_state.feedback_button_clicked:
+                        feedback_entry = {
+                             "Transaction Detail": st.session_state.query_input,
+                             "Analysis": st.session_state.analysis_result,
+                             "Source Document": st.session_state.source_document_name,
+                             "User Feedback": feedback,
+                             "Comments": feedback_comment,
+                             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                         }
+                        st.session_state.feedback_logs.append(feedback_entry)
+                        try:
+                            with open("feedback_data.json", "w") as f:
+                                json.dump(st.session_state.feedback_logs, f, indent=4)
+                            if feedback == "👎 No" and feedback_comment.strip():
+                                training_pairs = prepare_training_data(st.session_state.feedback_logs)
+                                num_pairs = save_training_data(training_pairs)
+                                st.success(f"✅ Feedback recorded and {num_pairs} training examples saved!")
+                            else:
+                                st.success("✅ Feedback recorded successfully!")
+                            st.session_state.feedback_submitted = True
+                            st.session_state.feedback_button_clicked = False
+                        except Exception as e:
+                            st.error(f"Error saving feedback: {e}")
+        elif app_submenu == "Root Cause Analysis":
+            st.header("🔍 Root Cause Analysis")
+            transactions = [log["Transaction Detail"] for log in st.session_state.deviation_logs]
+            selected_transaction = st.selectbox("Select a defect to analyze:", transactions if transactions else ["No defects available"])
+            if st.button("Identify Root Causes"):
+                with st.spinner("Identifying root causes..."):
+                    root_causes = ["Functional Defect", "UI/UX", "People (Human Error)", "Other"]
+                    #root_causes = ["Functional Defect", "UI/UX", "Integration Defect", "Validation/Rules Error", "Test Data Issue", "Environment Config", "Tool/Script Issue", "People (Human Error)", "Process Gap","Other"]
 
-    elif st.session_state.sub_section == "Deviation Analysis":
-        st.subheader("📊 Deviation Analysis")
+                    st.session_state.root_causes[selected_transaction] = root_causes
+                st.success("✅ Root causes identified!")
+            if selected_transaction in st.session_state.root_causes:
+                causes = st.session_state.root_causes[selected_transaction]
+                st.subheader("Identified Root Causes:")
+                for cause in causes:
+                    st.markdown(f"- {cause}")
+                st.subheader("📊 Fishbone Diagram (Ishikawa)")
+                plot_fishbone(causes)
+                 # Generate FDA CAPA Section using LLM
+                fda_capa_text = generate_fda_capa_section(
+                    defect_text=selected_transaction,
+                    root_causes=causes,
+                    llm_chain=st.session_state.qa_chain  # or whatever your RetrievalQA/OpenAI object is
+                 )
 
-    elif st.session_state.sub_section == "Root Cause Analysis":
-        st.subheader("⚠️Root Cause Analysis")
-        st.write("Review and troubleshoot errors.")
+                 # Generate full PDF
+                pdf_buffer = generate_pdf_report(
+                     transaction_detail=selected_transaction,
+                     analysis="Analysis Example",
+                     root_causes=causes,
+                     capa_suggestions=["Train staff", "Improve material quality"],
+                     fda_capa_text=fda_capa_text
+                 )
 
-    elif st.session_state.sub_section == "Root Cause Analysis":
-          st.header("📊 Analysis History & Insights")
+                 #pdf_buffer = generate_pdf_report(selected_transaction, "Analysis Example", causes, ["Train staff", "Improve material quality"])
+                st.download_button("📄 Download PDF Report", data=pdf_buffer, file_name="Defect_Report.pdf", mime="application/pdf")
+        elif app_submenu == "Analysis History":
+            st.header("📊 Analysis History & Insights")
+            if len(st.session_state.deviation_logs) == 0:
+                st.info("No analysis data available yet. Run some analyses first.")
+            else:
+                log_df = pd.DataFrame(st.session_state.deviation_logs)
+                if "Source Document" not in log_df.columns:
+                    log_df["Source Document"] = "Unknown"
+                columns_to_show = ["Defect Detail", "Analysis", "Source Document"]
+                if "Timestamp" in log_df.columns:
+                    columns_to_show.append("Timestamp")
+                st.dataframe(log_df[columns_to_show], use_container_width=True)
+                st.subheader("📊 Defect Statistics")
+                deviation_counts = log_df["Defect Detail"].value_counts()
+                fig, ax = plt.subplots(figsize=(10, 6))
+                deviation_counts.plot(kind="bar", ax=ax, color="skyblue")
+                ax.set_xlabel("Defect Type")
+                ax.set_ylabel("Occurrences")
+                ax.set_title("Deviation Count Chart")
+                plt.tight_layout()
+                st.pyplot(fig)
 
-    elif st.session_state.sub_section == "User Feedback":
-        st.subheader("📝 User Feedback Dashboard")
-        feedback_df = get_feedback_logs()
+         #####Adding Defect Categorizarion  Code. #####
 
-        if not feedback_df.empty:
-            st.subheader("📋 Collected Feedback")
+        elif app_submenu == "Defect Classifier":
+            st.header("📂 Defect Classifier (Auto Categorization + RCA)")
+            st.write("Upload a **training file** and a **test defect file**, and the system will predict:")
+            st.markdown("""
+             - 🧠 **Category**
+             - 🚨 **Priority**
+             - 🔍 **Root Cause**
+             """)
 
-            # Display relevant fields
-            display_df = feedback_df[["id", "user_query", "query_responce", "User Feedback", "user_feedback", "Timestamp"]]
-            st.dataframe(display_df, use_container_width=True)
+            train_file = st.file_uploader("📘 Upload Training File (Excel)", type=["xlsx"], key="defect_train_file")
+            test_file = st.file_uploader("📄 Upload Test File (Excel)", type=["xlsx"], key="defect_test_file")
 
-            # Feedback summary
-            st.subheader("📊 Feedback Summary")
-            positive_feedback_count = (feedback_df["user_reaction"] == 1).sum()
-            negative_feedback_count = (feedback_df["user_reaction"] == 0).sum()
+            if train_file and test_file and st.button("🔍 Classify Defects"):
+                from sentence_transformers import SentenceTransformer
+                from sklearn.neighbors import NearestNeighbors
+                import pandas as pd
 
-            st.write(f"✅ **Positive Feedback:** {positive_feedback_count}")
-            st.write(f"❌ **Negative Feedback:** {negative_feedback_count}")
+                try:
+                    df_train = pd.read_excel(train_file)
+                    df_test = pd.read_excel(test_file)
+                except Exception as e:
+                    st.error(f"❌ Failed to read uploaded files: {e}")
+                    st.stop()
 
-            # Feedback trends over time
-            st.subheader("📊 Feedback Trends Over Time")
+                # Ensure expected columns
+                required_cols = ["Defect_ID", "Summary", "Description", "Category", "Priority", "Root_Cause"]
+                if not all(col in df_train.columns for col in required_cols):
+                    st.error("❌ Training file must contain columns: " + ", ".join(required_cols))
+                    st.stop()
+                if not all(col in df_test.columns for col in ["Defect_ID", "Summary", "Description"]):
+                    st.error("❌ Test file must contain 'Defect_ID', 'Summary', 'Description'")
+                    st.stop()
 
-            feedback_over_time = (
-                feedback_df.groupby(feedback_df["Timestamp"].dt.date)["User Feedback"]
-                .value_counts()
-                .unstack()
-                .fillna(0)
-            )
+                # Load embedding model and train NearestNeighbors
+                model_embed = SentenceTransformer("all-MiniLM-L6-v2")
+                train_embeddings = model_embed.encode(df_train["Description"].astype(str).tolist())
+                test_embeddings = model_embed.encode(df_test["Description"].astype(str).tolist())
 
-            fig, ax = plt.subplots(figsize=(10, 6))
-            feedback_over_time.plot(kind="bar", ax=ax, stacked=True)
-            ax.set_xlabel("Date")
-            ax.set_ylabel("Number of Feedbacks")
-            ax.set_title("User Feedback Trends")
-            plt.xticks(rotation=45)
+                nn_model = NearestNeighbors(n_neighbors=3, metric="cosine")
+                nn_model.fit(train_embeddings)
 
-            st.pyplot(fig)
+                distances, indices = nn_model.kneighbors(test_embeddings)
 
-            # Download CSV button
-            csv_feedback = display_df.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Download Feedback as CSV", csv_feedback, "user_feedback.csv", "text/csv", key="download-feedback")
+                df_result = df_test.copy()
+                for i, idx_list in enumerate(indices):
+                    best_idx = idx_list[0]
+                    df_result.at[i, "Predicted_Category"] = df_train.at[best_idx, "Category"]
+                    df_result.at[i, "Predicted_Priority"] = df_train.at[best_idx, "Priority"]
+                    df_result.at[i, "Predicted_Root_Cause"] = df_train.at[best_idx, "Root_Cause"]
 
-        else:
-            st.warning("No feedback logs found in the database.")
+                st.success("✅ Classification complete. See below:")
+                st.dataframe(df_result, use_container_width=True)
+
+                csv = df_result.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Download Results as CSV", csv, "defect_classification_results.csv", "text/csv")
+
+                 # 📊 Charts
+                st.subheader("📊 Defect Breakdown by Category and Priority")
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("**Category Distribution**")
+                    st.bar_chart(df_result["Predicted_Category"].value_counts())
+
+                with col2:
+                    st.markdown("**Priority Distribution**")
+                    st.bar_chart(df_result["Predicted_Priority"].value_counts())
+
+                 # 🧵 Top 3 Similar Matches
+                st.subheader("🧵 Top 3 Similar Defects for Each Test Case")
+                for i in range(len(df_result)):
+                    st.markdown(f"**🔍 Test Case {df_result.at[i, 'Defect_ID']}**: {df_result.at[i, 'Summary']}")
+                    for rank, idx in enumerate(indices[i]):
+                        match = df_train.iloc[idx]
+                        st.markdown(f"- {rank+1}. **{match['Defect_ID']}** | *{match['Summary']}* | {match['Category']} | {match['Root_Cause']}")
+
+
+         #### End of the defect classifier #####
+
+        elif app_submenu == "User Feedback":
+            st.header("📝 User Feedback Dashboard")
+            if len(st.session_state.feedback_logs) == 0:
+                st.info("No feedback available yet.")
+            else:
+                feedback_df = pd.DataFrame(st.session_state.feedback_logs)
+                st.subheader("📋 Collected Feedback")
+                st.dataframe(feedback_df, use_container_width=True)
+                st.subheader("📊 Feedback Summary")
+                positive_feedback_count = (feedback_df["User Feedback"] == "👍 Yes").sum()
+                negative_feedback_count = (feedback_df["User Feedback"] == "👎 No").sum()
+                st.write(f"✅ **Positive Feedback:** {positive_feedback_count}")
+                st.write(f"❌ **Negative Feedback:** {negative_feedback_count}")
+                if not feedback_df.empty:
+                    st.subheader("📊 Feedback Trends Over Time")
+                    feedback_df["Timestamp"] = pd.to_datetime(feedback_df["Timestamp"])
+                    feedback_over_time = feedback_df.groupby(feedback_df["Timestamp"].dt.date)["User Feedback"].value_counts().unstack().fillna(0)
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    feedback_over_time.plot(kind="bar", ax=ax, stacked=True)
+                    ax.set_xlabel("Date")
+                    ax.set_ylabel("Number of Feedbacks")
+                    ax.set_title("User Feedback Trends")
+                    plt.xticks(rotation=45)
+                    st.pyplot(fig)
+                csv_feedback = feedback_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Feedback as CSV", csv_feedback, "user_feedback.csv", "text/csv", key='download-feedback')
+
+     # --- Footer ---
+    st.markdown("""
+    <div style="text-align: center; margin-top: 30px; padding: 15px; background-color: #f5f5f5;">
+        <p>Deviation Assistant Pro • Made with ❤️ by CloudHub</p>
+    </div>
+    """, unsafe_allow_html=True)
