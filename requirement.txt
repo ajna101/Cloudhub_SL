@@ -1,3 +1,4 @@
+matplotlib
 langchain
 openai
 faiss-cpu
@@ -5,7 +6,6 @@ pandas
 langgraph
 streamlit
 pyngrok
-matplotlib
 langchain-community
 tiktoken
 sentence-transformers
